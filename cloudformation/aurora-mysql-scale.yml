@@ -1,0 +1,322 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation Template to create Aurora Postgresql Cluster DB Instance'
+
+###############################################################################
+# Parameters 
+###############################################################################   
+
+Parameters:
+
+  ParentVPCStack:
+    Description: 'Provide Stack name of parent VPC stack based on VPC-3AZs yaml template. Refer Cloudformation dashboard in AWS Console to get this.'
+    Type: String
+    MinLength: '1'
+    MaxLength: '128'
+    AllowedPattern: '^[a-zA-Z]+[0-9a-zA-Z\-]*$'
+    
+  ParentSSHBastionStack:
+    Description: 'Provide Stack name of parent Amazon Linux bastion host stack based on VPC-SSH-Bastion yaml template. Refer Cloudformation dashboard in AWS Console to get this.'
+    Type: String
+    MinLength: '1'
+    MaxLength: '128'
+    AllowedPattern: '^[a-zA-Z]+[0-9a-zA-Z\-]*$'
+    
+  DBName:
+    Description: Database Name
+    Type: String
+    MinLength: '1'
+    MaxLength: '64'
+    AllowedPattern: "^[a-zA-Z]+[0-9a-zA-Z_]*$" 
+    ConstraintDescription: Must start with a letter. Only numbers, letters, and _ accepted. max length 64 characters 
+
+  DBPort:
+    Description: TCP/IP Port for the Database Instance
+    Type: Number
+    Default: 3306
+    ConstraintDescription: 'Must be in the range [1115-65535]'
+    MinValue: 1115
+    MaxValue: 65535
+    
+  DBUsername:
+    Description: Database master username
+    Type: String
+    Default: masteruser
+    MinLength: '1'
+    MaxLength: '16'
+    AllowedPattern: "^[a-zA-Z]+[0-9a-zA-Z_]*$"
+    ConstraintDescription: Must start with a letter. Only numbers, letters, and _ accepted. max length 16 characters
+     
+  DBEngineVersion:
+    Description: Select Database Engine Version
+    Type: String
+    Default: 5.7.mysql_aurora.2.09.0
+    AllowedValues:
+      - 5.6.mysql-aurora.1.19.1
+      - 5.7.mysql-aurora.2.04.3
+      - 5.7.mysql-aurora.2.03.4
+      - 5.7.mysql_aurora.2.09.0
+      - aurora-mysql
+     
+  DBInstanceClass:
+    Default: db.r4.large
+    Description: Database Instance Class. db.r5 instance classes are supported for Aurora PostgreSQL 10.6 or later. db.t3.medium instance class is supported for Aurora PostgreSQL 10.7 or later.
+    Type: String
+    AllowedValues:
+    - db.t3.medium
+    - db.r4.large
+    - db.r4.xlarge
+    - db.r4.2xlarge
+    - db.r4.4xlarge
+    - db.r4.8xlarge
+    - db.r4.16xlarge
+    - db.r5.large
+    - db.r5.xlarge
+    - db.r5.2xlarge
+    - db.r5.4xlarge
+    - db.r5.8xlarge
+    - db.r5.12xlarge
+    - db.r5.16xlarge
+    - db.r5.24xlarge
+
+  EnvironmentStage:
+    Type: String
+    Description: The environment tag is used to designate the Environment Stage of the associated AWS resource.
+    AllowedValues:
+          - dev
+          - test
+          - pre-prod
+          - prod
+    Default: dev  
+
+    ###############################################################################
+# Parameter groups
+###############################################################################
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: Environment
+        Parameters:
+          - EnvironmentStage
+      -      
+        Label:
+          default: DB Parameters
+        Parameters:
+          - DBName
+          - DBPort
+          - DBUsername
+          - DBInstanceClass
+          - DBEngineVersion
+      -
+        Label:
+          default: Networking
+        Parameters:
+          - ParentVPCStack
+          - ParentSSHBastionStack
+    
+###############################################################################
+# Mappings
+###############################################################################
+Mappings:
+  ClusterSettings:
+    scaling:
+      maxCapacity: 2
+      minCapacity: 1
+      cpuLoadTarget: 20
+     
+###############################################################################
+# Conditions
+############################################################################### 
+
+###############################################################################
+# Resources 
+###############################################################################   
+    
+Resources:
+
+  DBSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: !Ref 'AWS::StackName'
+      SubnetIds: !Split [',', {'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetsPrivate'}]  
+      
+  ClusterSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: !Ref 'AWS::StackName'
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: !Ref DBPort
+        ToPort: !Ref DBPort
+        SourceSecurityGroupId: {'Fn::ImportValue': !Sub '${ParentSSHBastionStack}-BastionSecurityGroupID'}
+        Description: 'Access to Bastion Host Security Group'
+      VpcId: {'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'}
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-AuroraClusterSecurityGroup'
+        
+  ClusterSecurityGroupIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !GetAtt 'ClusterSecurityGroup.GroupId'
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      Description: 'Self Reference'        
+
+  AuroraMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Join ['/', [!Ref EnvironmentStage, 'aurora-mysql', !Ref 'AWS::StackName']]
+      Description: !Join ['', ['Aurora MySQL Master User Secret ', 'for CloudFormation Stack ', !Ref 'AWS::StackName']]
+      GenerateSecretString:
+        SecretStringTemplate: !Join ['', ['{"username": "', !Ref DBUsername, '"}']]
+        GenerateStringKey: "password"
+        ExcludeCharacters: '"@/\'
+        PasswordLength: 16
+
+  SecretAuroraClusterAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref AuroraMasterSecret
+      TargetId: !Ref AuroraDBCluster
+      TargetType: AWS::RDS::DBCluster
+
+  AuroraSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref AuroraMasterSecret
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Deny"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "secretsmanager:DeleteSecret"
+            Resource: "*"
+  
+        
+  AuroraDBCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: aurora-mysql
+      EngineVersion: !Ref DBEngineVersion
+      DatabaseName: !Ref DBName
+      Port: !Ref DBPort
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref AuroraMasterSecret, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref AuroraMasterSecret, ':SecretString:password}}' ]]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref ClusterSecurityGroup  
+      BackupRetentionPeriod: 7
+      StorageEncrypted: true
+        
+  AuroraDBFirstInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      CopyTagsToSnapshot: true  
+      DBInstanceClass:
+        Ref: DBInstanceClass
+      DBClusterIdentifier: !Ref AuroraDBCluster  
+      Engine: aurora-mysql
+      EngineVersion: !Ref DBEngineVersion
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+
+  AuroraDBSecondInstance:
+    Type: AWS::RDS::DBInstance
+    DependsOn: 
+      - AuroraDBFirstInstance
+    Properties:
+      CopyTagsToSnapshot: true  
+      DBInstanceClass:
+        Ref: DBInstanceClass
+      DBClusterIdentifier: !Ref AuroraDBCluster  
+      Engine: aurora-mysql
+      EngineVersion: !Ref DBEngineVersion
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+
+## Add scaling policy
+
+  roleScalableTarget:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-aas-target-${AWS::Region}
+      Description: Role to integrate the Aurora DB cluster with Application AutoScaling.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+           - Effect: Allow
+             Action:
+               - sts:AssumeRole
+             Principal:
+               Service:
+                  - rds.application-autoscaling.amazonaws.com
+                  
+  dbScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: [ AuroraDBSecondInstance ]
+    Properties:
+        ServiceNamespace: 'rds'
+        ScalableDimension: 'rds:cluster:ReadReplicaCount'
+        ResourceId: !Sub "cluster:${AuroraDBCluster}"
+        MaxCapacity: !FindInMap [ ClusterSettings, scaling, maxCapacity ]
+        MinCapacity: !FindInMap [ ClusterSettings, scaling, minCapacity ]
+        RoleARN: !GetAtt roleScalableTarget.Arn
+    
+#ResourceId: !GetAtt resLabSupport.DBClusterScalableTarget
+  dbScalingPolicy:
+    Type : AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+        PolicyName: !Sub ${AWS::StackName}-autoscale-readers
+        PolicyType: TargetTrackingScaling
+        ScalingTargetId: !Ref dbScalableTarget
+        TargetTrackingScalingPolicyConfiguration:
+          PredefinedMetricSpecification:
+            PredefinedMetricType: RDSReaderAverageCPUUtilization
+          ScaleInCooldown: 180
+          ScaleOutCooldown: 180
+          TargetValue: !FindInMap [ ClusterSettings, scaling, cpuLoadTarget ]
+
+
+#  resLabSupport:
+#    Type: Custom::resLabSupport
+#    Properties:
+#        StackRegion: !Ref 'AWS::Region'
+#        StackName: !Ref 'AWS::StackName'
+#        StackUUID: !Select
+#          - 2
+#          - !Split
+#            - "/"
+#            - !Ref 'AWS::StackId'
+#        Cluster:  !Ref AuroraDBCluster
+
+###############################################################################
+# Outputs 
+###############################################################################   
+Outputs:
+  ClusterEndpoint:
+    Description: 'Aurora Cluster/Writer Endpoint'
+    Value: !GetAtt 'AuroraDBCluster.Endpoint.Address'
+  ReaderEndpoint:
+    Description: 'Aurora Reader Endpoint'
+    Value: !GetAtt 'AuroraDBCluster.ReadEndpoint.Address'
+  Port:
+    Description: 'Aurora Endpoint Port'
+    Value: !GetAtt 'AuroraDBCluster.Endpoint.Port'
+  DBUsername:
+    Description: 'Database master username'
+    Value: !Ref DBUsername
+  DBName:
+    Description: 'Database Name'
+    Value: !Ref DBName
+    

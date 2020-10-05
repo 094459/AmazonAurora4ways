@@ -1,0 +1,8 @@
+{
+    "engine": "mysql",
+    "host": "sample-instance.c1sn8phzxf9c.eu-central-1.rds.amazonaws.com",
+    "username": "masteruser",
+    "password": "secret123",
+    "dbClusterIdentifier": "sample-cluster",
+    "dbInstanceIdentifier": "sample-instance"
+  }

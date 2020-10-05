@@ -1,0 +1,320 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation Template to create Aurora Postgresql Cluster DB Instance'
+
+###############################################################################
+# Parameters 
+###############################################################################   
+
+Parameters:
+
+  ParentVPCStack:
+    Description: 'Provide Stack name of parent VPC stack based on VPC-3AZs yaml template. Refer Cloudformation dashboard in AWS Console to get this.'
+    Type: String
+    MinLength: '1'
+    MaxLength: '128'
+    AllowedPattern: '^[a-zA-Z]+[0-9a-zA-Z\-]*$'
+    
+  ParentSSHBastionStack:
+    Description: 'Provide Stack name of parent Amazon Linux bastion host stack based on VPC-SSH-Bastion yaml template. Refer Cloudformation dashboard in AWS Console to get this.'
+    Type: String
+    MinLength: '1'
+    MaxLength: '128'
+    AllowedPattern: '^[a-zA-Z]+[0-9a-zA-Z\-]*$'
+    
+  DBName:
+    Description: Database Name
+    Type: String
+    MinLength: '1'
+    MaxLength: '64'
+    AllowedPattern: "^[a-zA-Z]+[0-9a-zA-Z_]*$" 
+    ConstraintDescription: Must start with a letter. Only numbers, letters, and _ accepted. max length 64 characters 
+
+  DBPort:
+    Description: TCP/IP Port for the Database Instance
+    Type: Number
+    Default: 3306
+    ConstraintDescription: 'Must be in the range [1115-65535]'
+    MinValue: 1115
+    MaxValue: 65535
+    
+  DBUsername:
+    Description: Database master username
+    Type: String
+    Default: masteruser
+    MinLength: '1'
+    MaxLength: '16'
+    AllowedPattern: "^[a-zA-Z]+[0-9a-zA-Z_]*$"
+    ConstraintDescription: Must start with a letter. Only numbers, letters, and _ accepted. max length 16 characters
+     
+  DBEngineVersion:
+    Description: Select Database Engine Version
+    Type: String
+    Default: 5.7.mysql_aurora.2.09.0
+    AllowedValues:
+      - 5.6.mysql-aurora.1.19.1
+      - 5.7.mysql-aurora.2.04.3
+      - 5.7.mysql-aurora.2.03.4
+      - 5.7.mysql_aurora.2.09.0
+      - aurora-mysql
+     
+  DBInstanceClass:
+    Default: db.r4.large
+    Description: Database Instance Class. db.r5 instance classes are supported for Aurora PostgreSQL 10.6 or later. db.t3.medium instance class is supported for Aurora PostgreSQL 10.7 or later.
+    Type: String
+    AllowedValues:
+    - db.t3.medium
+    - db.r4.large
+    - db.r4.xlarge
+    - db.r4.2xlarge
+    - db.r4.4xlarge
+    - db.r4.8xlarge
+    - db.r4.16xlarge
+    - db.r5.large
+    - db.r5.xlarge
+    - db.r5.2xlarge
+    - db.r5.4xlarge
+    - db.r5.8xlarge
+    - db.r5.12xlarge
+    - db.r5.16xlarge
+    - db.r5.24xlarge
+
+  DBSnapshotName:
+    Description: Optional. DB Snapshot ID to restore database. Leave this blank if you are not restoring from a snapshot.
+    Type: String
+    Default: ""
+ 
+  EnvironmentStage:
+    Type: String
+    Description: The environment tag is used to designate the Environment Stage of the associated AWS resource.
+    AllowedValues:
+          - dev
+          - test
+          - pre-prod
+          - prod
+    Default: dev  
+
+    ###############################################################################
+# Parameter groups
+###############################################################################
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: Environment
+        Parameters:
+          - EnvironmentStage
+      -      
+        Label:
+          default: DB Parameters
+        Parameters:
+          - DBName
+          - DBPort
+          - DBUsername
+          - DBInstanceClass
+          - DBEngineVersion
+          - DBSnapshotName
+          - NotificationList
+      -
+        Label:
+          default: Networking
+        Parameters:
+          - ParentVPCStack
+          - ParentSSHBastionStack
+    
+###############################################################################
+# Mappings
+###############################################################################
+ 
+     
+###############################################################################
+# Conditions
+############################################################################### 
+
+Conditions:
+  IsUseDBSnapshot: !Not [!Equals [!Ref DBSnapshotName, ""]]
+  IsNotUseDBSnapshot: !Not [Condition: IsUseDBSnapshot]
+
+  ###############################################################################
+# Resources 
+###############################################################################   
+    
+Resources:
+
+  DBSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: !Ref 'AWS::StackName'
+      SubnetIds: !Split [',', {'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetsPrivate'}]  
+      
+  ClusterSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: !Ref 'AWS::StackName'
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: !Ref DBPort
+        ToPort: !Ref DBPort
+        SourceSecurityGroupId: {'Fn::ImportValue': !Sub '${ParentSSHBastionStack}-BastionSecurityGroupID'}
+        Description: 'Access to Bastion Host Security Group'
+      VpcId: {'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'}
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-AuroraClusterSecurityGroup'
+        
+  ClusterSecurityGroupIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !GetAtt 'ClusterSecurityGroup.GroupId'
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      Description: 'Self Reference'        
+      
+  AuroraKMSCMK:
+    Type: 'AWS::KMS::Key'
+    DeletionPolicy: Retain
+    Properties:
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action: 'kms:*'
+          Resource: '*'
+        - Effect: Allow
+          Principal:
+            AWS: '*'
+          Action:
+          - 'kms:Encrypt'
+          - 'kms:Decrypt'
+          - 'kms:ReEncrypt*'
+          - 'kms:GenerateDataKey*'
+          - 'kms:CreateGrant'
+          - 'kms:ListGrants'
+          - 'kms:DescribeKey'
+          Resource: '*'
+          Condition:
+            StringEquals:
+              'kms:CallerAccount': !Ref 'AWS::AccountId'
+              'kms:ViaService': !Sub 'rds.${AWS::Region}.amazonaws.com'
+
+  AuroraKMSCMKAlias:
+    Type: 'AWS::KMS::Alias'
+    DeletionPolicy: Retain
+    DependsOn: AuroraDBCluster
+    Properties:
+      AliasName: !Sub 'alias/${AuroraDBCluster}'
+      TargetKeyId: !Ref AuroraKMSCMK
+
+  AuroraMasterSecret:
+    Condition: IsNotUseDBSnapshot
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Join ['/', [!Ref EnvironmentStage, 'aurora-mysql', !Ref 'AWS::StackName']]
+      Description: !Join ['', ['Aurora MySQL Master User Secret ', 'for CloudFormation Stack ', !Ref 'AWS::StackName']]
+      GenerateSecretString:
+        SecretStringTemplate: !Join ['', ['{"username": "', !Ref DBUsername, '"}']]
+        GenerateStringKey: "password"
+        ExcludeCharacters: '"@/\'
+        PasswordLength: 16
+
+  SecretAuroraClusterAttachment:
+    Condition: IsNotUseDBSnapshot
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref AuroraMasterSecret
+      TargetId: !Ref AuroraDBCluster
+      TargetType: AWS::RDS::DBCluster
+
+  AuroraSecretResourcePolicy:
+    Condition: IsNotUseDBSnapshot
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref AuroraMasterSecret
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Deny"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "secretsmanager:DeleteSecret"
+            Resource: "*"
+  
+        
+  AuroraDBCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: aurora-mysql
+      EngineVersion: !Ref DBEngineVersion
+      DatabaseName: !If [IsUseDBSnapshot, !Ref "AWS::NoValue", !Ref DBName]
+      Port: !Ref DBPort
+      MasterUsername:
+        !If [IsUseDBSnapshot, !Ref "AWS::NoValue", !Join ['', ['{{resolve:secretsmanager:', !Ref AuroraMasterSecret, ':SecretString:username}}' ]]]
+      MasterUserPassword:
+        !If [IsUseDBSnapshot, !Ref "AWS::NoValue", !Join ['', ['{{resolve:secretsmanager:', !Ref AuroraMasterSecret, ':SecretString:password}}' ]]]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+      - !Ref ClusterSecurityGroup  
+      BackupRetentionPeriod: 7
+      SnapshotIdentifier: !If [IsUseDBSnapshot, !Ref DBSnapshotName, !Ref "AWS::NoValue"]
+      StorageEncrypted:  !If [IsUseDBSnapshot, !Ref "AWS::NoValue", true]
+      KmsKeyId: !If [IsNotUseDBSnapshot, !Ref AuroraKMSCMK, !Ref 'AWS::NoValue']
+        
+  AuroraDBFirstInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      CopyTagsToSnapshot: true  
+      DBInstanceClass:
+        Ref: DBInstanceClass
+      DBClusterIdentifier: !Ref AuroraDBCluster  
+      Engine: aurora-mysql
+      EngineVersion: !Ref DBEngineVersion
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref AuroraKMSCMK
+      PerformanceInsightsRetentionPeriod: 7
+
+  AuroraDBSecondInstance:
+    Type: AWS::RDS::DBInstance
+    DependsOn: 
+      - AuroraDBFirstInstance
+    Properties:
+      CopyTagsToSnapshot: true  
+      DBInstanceClass:
+        Ref: DBInstanceClass
+      DBClusterIdentifier: !Ref AuroraDBCluster  
+      Engine: aurora-mysql
+      EngineVersion: !Ref DBEngineVersion
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref AuroraKMSCMK
+      PerformanceInsightsRetentionPeriod: 7
+          
+  
+###############################################################################
+# Outputs 
+###############################################################################   
+Outputs:
+  ClusterEndpoint:
+    Description: 'Aurora Cluster/Writer Endpoint'
+    Value: !GetAtt 'AuroraDBCluster.Endpoint.Address'
+  ReaderEndpoint:
+    Description: 'Aurora Reader Endpoint'
+    Value: !GetAtt 'AuroraDBCluster.ReadEndpoint.Address'
+  Port:
+    Description: 'Aurora Endpoint Port'
+    Value: !GetAtt 'AuroraDBCluster.Endpoint.Port'
+  DBUsername:
+    Description: 'Database master username'
+    Value: !Ref DBUsername
+  DBName:
+    Description: 'Database Name'
+    Value: !Ref DBName
+    
